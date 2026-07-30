@@ -1,0 +1,7 @@
+- [x] `src/data_loader.py` の実装
+- [x] `src/wos_calculator.py` の実装
+- [x] `src/item_allocator.py` の実装
+- [x] `src/reporter.py` の実装
+- [x] `run.py` の実装
+- [x] 結合テストと動作確認
+- [x] `walkthrough.md` の作成
