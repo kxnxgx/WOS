@@ -71,6 +71,9 @@ class ItemAllocator:
                     move_qty = math.ceil(move)
                     
                     if move_qty > 0:
+                        shipper_pre_wos = round(s['current_stock'] / s['avg_sales_4w'], 1) if s['avg_sales_4w'] > 0 else None
+                        receiver_pre_wos = round(r['current_stock'] / r['avg_sales_4w'], 1) if r['avg_sales_4w'] > 0 else None
+
                         shipper_post_stock = s['current_stock'] - move_qty
                         receiver_post_stock = r['current_stock'] + move_qty
                         
@@ -96,10 +99,12 @@ class ItemAllocator:
                             'sell_through': sell_through_val if has_sell_through else None,
                             'shipper': s['store'],
                             'shipper_stock': s['stock_qty'],
+                            'shipper_pre_wos': shipper_pre_wos,
                             'shipper_post_wos': shipper_post_wos,
                             'receiver': r['store'],
                             'receiver_stock': r['stock_qty'],
                             'move_qty': move_qty,
+                            'receiver_pre_wos': receiver_pre_wos,
                             'receiver_post_wos': receiver_post_wos,
                             'reason': reason
                         })
