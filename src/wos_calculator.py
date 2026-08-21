@@ -5,7 +5,8 @@ class WOSCalculator:
     @staticmethod
     def calculate(sales_df: pd.DataFrame, stock_df: pd.DataFrame,
                   order_df: pd.DataFrame = None,
-                  next_order_df: pd.DataFrame = None) -> pd.DataFrame:
+                  next_order_df: pd.DataFrame = None,
+                  exclude_stores: list = None) -> pd.DataFrame:
         """
         売上データと在庫データから、SKU・店舗ごとのWOSを計算する
         
@@ -22,12 +23,22 @@ class WOSCalculator:
         
         if sales_df.empty or stock_df.empty:
             raise ValueError("売上データまたは在庫データが空です。")
+
+        # 除外店舗のフィルタリング（WOS計算・移動推奨・ヒートマップ対象外）
+        if exclude_stores:
+            exclude_strs = [str(s).strip() for s in exclude_stores]
+            print(f"WOS計算・移動推奨から除外する店舗: {exclude_strs}")
+            stock_for_wos = stock_df[~stock_df['store'].astype(str).str.strip().isin(exclude_strs)].copy()
+            sales_for_wos = sales_df[~sales_df['store'].astype(str).str.strip().isin(exclude_strs)].copy()
+        else:
+            stock_for_wos = stock_df.copy()
+            sales_for_wos = sales_df.copy()
             
-        # 最近4週間（28日間）のデータを抽出
-        max_date = sales_df['date'].max()
+        # 最近4週間（28日間）のデータを抽出（除外店舗を除く）
+        max_date = sales_for_wos['date'].max()
         cutoff_date = max_date - pd.Timedelta(days=28)
         
-        recent_sales = sales_df[sales_df['date'] > cutoff_date].copy()
+        recent_sales = sales_for_wos[sales_for_wos['date'] > cutoff_date].copy()
         
         # 店舗×SKUごとの合計販売数を計算
         sales_agg = recent_sales.groupby(['store', 'sku'])['sales_qty'].sum().reset_index()
@@ -40,14 +51,14 @@ class WOSCalculator:
         
         # 店舗・SKUのユニークな組み合わせを作成
         all_combinations = pd.merge(
-            stock_df[['store', 'sku']], 
+            stock_for_wos[['store', 'sku']], 
             sales_agg[['store', 'sku']], 
             on=['store', 'sku'], 
             how='outer'
         ).drop_duplicates()
         
         # マージ
-        wos_df = pd.merge(all_combinations, stock_df, on=['store', 'sku'], how='left')
+        wos_df = pd.merge(all_combinations, stock_for_wos, on=['store', 'sku'], how='left')
         wos_df = pd.merge(wos_df, sales_agg[['store', 'sku', 'avg_sales_4w']], on=['store', 'sku'], how='left')
         
         # 欠損値補完

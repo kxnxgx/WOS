@@ -136,7 +136,13 @@ def main():
             next_order_path = found_next
             print(f"[自動検索] 次シーズン発注数データを検出しました: {os.path.basename(next_order_path)}")
 
+    # 除外対象店舗リスト（WOS計算・移動推奨・ヒートマップ対象外）
+    # ※全社の消化率計算（累計売上）には含まれます。
+    EXCLUDE_STORES = ['6142']
+
     print(f"[設定] 優先集約の消化率閾値: {args.threshold:.0f}%")
+    if EXCLUDE_STORES:
+        print(f"[設定] 移動・WOS計算からの除外店舗: {', '.join(EXCLUDE_STORES)}")
 
     try:
         # 1. データロード
@@ -154,8 +160,13 @@ def main():
         if next_order_path and os.path.exists(next_order_path):
             next_order_df = loader.load_order_data(next_order_path)
 
-        # 2. WOS計算（+ 消化率・継続品判定）
-        wos_df = WOSCalculator.calculate(sales_df, stock_df, order_df, next_order_df)
+        # 2. WOS計算（+ 消化率・継続品判定・店舗除外）
+        wos_df = WOSCalculator.calculate(
+            sales_df, stock_df,
+            order_df=order_df,
+            next_order_df=next_order_df,
+            exclude_stores=EXCLUDE_STORES
+        )
 
         # 3. アイテム移動推奨算出
         move_df = ItemAllocator.allocate(wos_df, sell_through_threshold=args.threshold)
