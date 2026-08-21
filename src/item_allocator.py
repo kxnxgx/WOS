@@ -68,14 +68,18 @@ class ItemAllocator:
                 r['current_stock'] = r['stock_qty']
 
             for s in shippers:
-                if s['surplus'] <= 0: continue
+                if s['surplus'] <= 0 or s['current_stock'] <= 0: continue
                 
                 for r in receivers:
                     if r['deficit'] <= 0: continue
-                    if s['surplus'] <= 0: break
+                    if s['surplus'] <= 0 or s['current_stock'] <= 0: break
                     
+                    # 移動候補数量（切り上げ）
                     move = min(s['surplus'], r['deficit'])
-                    move_qty = math.ceil(move)
+                    candidate_qty = math.ceil(move)
+                    
+                    # 実在庫を超える移動は不可（手元の現在庫が上限）
+                    move_qty = min(candidate_qty, int(s['current_stock']))
                     
                     if move_qty > 0:
                         shipper_pre_wos = round(s['current_stock'] / s['avg_sales_4w'], 1) if s['avg_sales_4w'] > 0 else None
@@ -109,9 +113,9 @@ class ItemAllocator:
                             'shipper_stock': s['stock_qty'],
                             'shipper_pre_wos': shipper_pre_wos,
                             'shipper_post_wos': shipper_post_wos,
+                            'move_qty': move_qty,
                             'receiver': r['store'],
                             'receiver_stock': r['stock_qty'],
-                            'move_qty': move_qty,
                             'receiver_pre_wos': receiver_pre_wos,
                             'receiver_post_wos': receiver_post_wos,
                             'reason': reason
@@ -119,8 +123,8 @@ class ItemAllocator:
                         
                         s['current_stock'] -= move_qty
                         r['current_stock'] += move_qty
-                        s['surplus'] -= move
-                        r['deficit'] -= move
+                        s['surplus'] -= move_qty
+                        r['deficit'] -= move_qty
                         
         result = pd.DataFrame(move_records)
         return result
