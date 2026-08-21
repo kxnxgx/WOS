@@ -24,15 +24,27 @@ class WOSCalculator:
         if sales_df.empty or stock_df.empty:
             raise ValueError("売上データまたは在庫データが空です。")
 
+        # BULK（倉庫）在庫の抽出（SKUごとの合計在庫数）
+        bulk_mask = stock_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False)
+        bulk_df = stock_df[bulk_mask].groupby('sku')['stock_qty'].sum().reset_index()
+        bulk_df.columns = ['sku', 'bulk_stock']
+        print(f"BULK（倉庫）在庫データ: {len(bulk_df)} SKU 検出")
+
         # 除外店舗のフィルタリング（WOS計算・移動推奨・ヒートマップ対象外）
-        if exclude_stores:
-            exclude_strs = [str(s).strip() for s in exclude_stores]
+        # ※バルク（倉庫）も店舗間移動の対象外として除外
+        exclude_strs = [str(s).strip() for s in exclude_stores] if exclude_stores else []
+        if exclude_strs:
             print(f"WOS計算・移動推奨から除外する店舗: {exclude_strs}")
-            stock_for_wos = stock_df[~stock_df['store'].astype(str).str.strip().isin(exclude_strs)].copy()
-            sales_for_wos = sales_df[~sales_df['store'].astype(str).str.strip().isin(exclude_strs)].copy()
-        else:
-            stock_for_wos = stock_df.copy()
-            sales_for_wos = sales_df.copy()
+            
+        stock_for_wos = stock_df[
+            (~stock_df['store'].astype(str).str.strip().isin(exclude_strs)) &
+            (~bulk_mask)
+        ].copy()
+        
+        sales_for_wos = sales_df[
+            (~sales_df['store'].astype(str).str.strip().isin(exclude_strs)) &
+            (~sales_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False))
+        ].copy()
             
         # 最近4週間（28日間）のデータを抽出（除外店舗を除く）
         max_date = sales_for_wos['date'].max()
@@ -109,6 +121,10 @@ class WOSCalculator:
             wos_df['is_continuation'] = wos_df['sku'].isin(next_skus)
         else:
             wos_df['is_continuation'] = False
+
+        # --- BULK在庫の結合 ---
+        wos_df = pd.merge(wos_df, bulk_df, on='sku', how='left')
+        wos_df['bulk_stock'] = wos_df['bulk_stock'].fillna(0).astype(int)
 
         return wos_df
 

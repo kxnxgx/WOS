@@ -55,6 +55,13 @@ class ItemAllocator:
             if 'is_continuation' in wos_df.columns:
                 is_cont = wos_df.loc[wos_df['sku'] == sku, 'is_continuation'].iloc[0]
 
+            # このSKUのBULK在庫
+            bulk_stock_val = 0
+            if 'bulk_stock' in wos_df.columns:
+                b_val = wos_df.loc[wos_df['sku'] == sku, 'bulk_stock']
+                if not b_val.empty and pd.notna(b_val.iloc[0]):
+                    bulk_stock_val = int(b_val.iloc[0])
+
             for s in shippers:
                 s['current_stock'] = s['stock_qty']
             for r in receivers:
@@ -96,6 +103,7 @@ class ItemAllocator:
                             'sku': sku,
                             'item_name': item_name,
                             'color_name': color_name,
+                            'bulk_stock': bulk_stock_val,
                             'sell_through': sell_through_val if has_sell_through else None,
                             'shipper': s['store'],
                             'shipper_stock': s['stock_qty'],

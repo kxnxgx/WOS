@@ -9,9 +9,9 @@ class Reporter:
         
         disp = move_df.copy()
 
-        # 列順序を定義（A〜O列：出荷側 ➔ 移動推奨数 ➔ 受入側）
+        # 列順序を定義（A〜P列：商品情報 ➔ BULK在庫 ➔ 消化率 ➔ 出荷側 ➔ 移動推奨数 ➔ 受入側）
         desired_cols = [
-            'priority', 'sku', 'item_name', 'color_name', 'sell_through',
+            'priority', 'sku', 'item_name', 'color_name', 'bulk_stock', 'sell_through',
             'shipper', 'shipper_stock', 'shipper_pre_wos', 'shipper_post_wos',
             'move_qty',
             'receiver', 'receiver_stock', 'receiver_pre_wos', 'receiver_post_wos',
@@ -33,14 +33,15 @@ class Reporter:
             'sku': '商品コード',
             'item_name': '商品名',
             'color_name': 'カラー',
+            'bulk_stock': 'BULK在庫',
             'sell_through': '消化率(%)',
             'shipper': '出荷店舗',
             'shipper_stock': '出荷元在庫',
             'shipper_pre_wos': '出荷前WOS',
             'shipper_post_wos': '出荷後WOS',
+            'move_qty': '移動推奨数',
             'receiver': '受入店舗',
             'receiver_stock': '受入先在庫',
-            'move_qty': '移動推奨数',
             'receiver_pre_wos': '受入前WOS',
             'receiver_post_wos': '受入後WOS',
             'reason': '理由'
@@ -127,6 +128,12 @@ class Reporter:
         else:
             is_cont_series = pd.Series([False] * len(disp), index=disp.index)
             
+        # BULK在庫のアラート装飾（>0 の場合は黄色ハイライト）
+        if 'bulk_stock' in disp.columns:
+            disp['bulk_stock'] = disp['bulk_stock'].apply(
+                lambda v: f"<span class='bulk-alert'>{v}</span>" if pd.notna(v) and v > 0 else f"<span class='bulk-zero'>{v}</span>"
+            )
+
         disp = Reporter._prepare_move_df(disp)
         
         # HTMLテーブルを生成
@@ -168,6 +175,12 @@ class Reporter:
             master_c = wos_df[['sku', 'color_name']].drop_duplicates('sku')
             summary = summary.merge(master_c, on='sku', how='left')
 
+        # BULK在庫列の追加
+        if 'bulk_stock' in wos_df.columns:
+            bulk_master = wos_df[['sku', 'bulk_stock']].drop_duplicates('sku')
+            summary = summary.merge(bulk_master, on='sku', how='left')
+            summary['bulk_stock'] = summary['bulk_stock'].fillna(0).astype(int)
+
         # 消化率列の追加
         has_st = 'sell_through' in wos_df.columns
         if has_st:
@@ -186,6 +199,7 @@ class Reporter:
         col_order = ['sku']
         if 'item_name' in summary.columns: col_order.append('item_name')
         if 'color_name' in summary.columns: col_order.append('color_name')
+        if 'bulk_stock' in summary.columns: col_order.append('bulk_stock')
         if has_st:
             col_order += ['sell_through', 'cumulative_sales', 'total_order']
         col_order += ['store_count', 'avg_wos', 'min_wos', 'max_wos', 'move_count']
@@ -199,6 +213,7 @@ class Reporter:
 
         col_rename = {
             'sku': '商品コード', 'item_name': '商品名', 'color_name': 'カラー',
+            'bulk_stock': 'BULK在庫',
             'sell_through': '消化率(%)', 'cumulative_sales': '累計売上数',
             'total_order': '発注数', 'store_count': '対象店舗数',
             'avg_wos': '平均WOS', 'min_wos': '最小WOS', 'max_wos': '最大WOS',
@@ -243,11 +258,12 @@ class Reporter:
         workbook = writer.book
         if sheet_name in workbook.sheetnames:
             worksheet = workbook[sheet_name]
-            # 青系の薄い色
+            # 青系の薄い色（継続品）
             cont_fill = PatternFill(start_color="E6F2FF", end_color="E6F2FF", fill_type="solid")
+            # 薄いオレンジ/黄色（BULK在庫注意）
+            bulk_fill = PatternFill(start_color="FFEAA7", end_color="FFEAA7", fill_type="solid")
             
             # is_continuation はデータフレームのどこにあるか？
-            # 準備前の df からインデックスを取得する
             if 'is_continuation' in df.columns:
                 is_cont_series = df['is_continuation'].reset_index(drop=True)
                 for row_idx, is_cont in enumerate(is_cont_series):
@@ -255,6 +271,13 @@ class Reporter:
                         # ヘッダーが1行目なのでデータは2行目から
                         for col_idx in range(1, worksheet.max_column + 1):
                             worksheet.cell(row=row_idx + 2, column=col_idx).fill = cont_fill
+
+            # BULK在庫（E列＝5列目）のハイライト
+            if 'bulk_stock' in df.columns:
+                bulk_series = df['bulk_stock'].reset_index(drop=True)
+                for row_idx, b_val in enumerate(bulk_series):
+                    if pd.notna(b_val) and b_val > 0:
+                        worksheet.cell(row=row_idx + 2, column=5).fill = bulk_fill
 
     @staticmethod
     def generate_excel(wos_df: pd.DataFrame, move_df: pd.DataFrame, output_path: str = "WOS_Report.xlsx"):
@@ -415,6 +438,12 @@ class Reporter:
             border: 1px solid #93c5fd; border-radius: 4px;
             padding: 1px 6px; font-size: 0.82em; margin-left: 6px;
         }}
+        .bulk-alert {{
+            display: inline-block; background: #ffeaa7; color: #b7791f;
+            border: 1px solid #fdcb6e; border-radius: 4px;
+            padding: 1px 8px; font-weight: bold; font-size: 0.9em;
+        }}
+        .bulk-zero {{ color: #cbd5e0; }}
         /* ヒートマップテーブル */
         .heatmap-table {{
             border-collapse: collapse; font-size: 0.82em;
@@ -494,6 +523,7 @@ class Reporter:
             <li><strong>消化率</strong>: 全期間累計売上数 ÷ 発注数（総計列）× 100</li>
             <li><strong>⭐ 優先集約</strong>: 消化率 ≥ {threshold:.0f}% の SKU（完売を狙う）</li>
             <li><strong>📦 通常集約</strong>: 消化率 &lt; {threshold:.0f}% または消化率データなし</li>
+            <li><strong>BULK在庫</strong>: 倉庫在庫数（⚠️ 1以上の場合は黄色強調表示：店舗間移動より倉庫出荷を優先検討）</li>
             <li><strong>出荷前WOS → 出荷後WOS</strong>: 移動前の出荷元WOS → 移動後（在庫減）の予測WOS</li>
             <li><strong>受入前WOS → 受入後WOS</strong>: 移動前の受入先WOS → 移動後（在庫増）の予測WOS</li>
             <li><strong>出荷候補</strong>: SKUの全店舗平均WOSより高い店舗（在庫余剰）</li>
