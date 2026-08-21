@@ -3,6 +3,32 @@ import math
 
 class ItemAllocator:
     @staticmethod
+    def _get_store_priority_rank(store_name: str) -> int:
+        """店舗名から受入優先順位（1〜9、小さいほど優先）を判定する"""
+        s = str(store_name)
+        # TOKYO NODE を先に判定（TOKYO と誤判定しないため）
+        if 'NODE' in s:
+            return 4
+        elif 'TOKYO' in s:
+            return 1
+        elif 'ルクア' in s:
+            return 2
+        elif '名古屋' in s:
+            return 3
+        elif '京王新宿' in s:
+            return 5
+        elif '大丸心斎橋' in s:
+            return 6
+        elif '玉川高島屋' in s:
+            return 7
+        elif 'HUTTE' in s or 'ヒュッテ' in s:
+            return 8
+        elif 'NARITA' in s:
+            return 9
+        else:
+            return 99
+
+    @staticmethod
     def allocate(wos_df: pd.DataFrame,
                  sell_through_threshold: float = 80.0) -> pd.DataFrame:
         """
@@ -37,8 +63,10 @@ class ItemAllocator:
             receivers['deficit'] = (wos_avg * receivers['avg_sales_4w']) - receivers['stock_qty']
             
             # 余剰分と不足分をマッチング
+            # 受入店舗は deficit（不足数）降順、同点時は store_rank（店舗優先順位）昇順
+            receivers['store_rank'] = receivers['store'].apply(ItemAllocator._get_store_priority_rank)
             shippers = shippers.sort_values('surplus', ascending=False).to_dict('records')
-            receivers = receivers.sort_values('deficit', ascending=False).to_dict('records')
+            receivers = receivers.sort_values(by=['deficit', 'store_rank'], ascending=[False, True]).to_dict('records')
 
             # このSKUの消化率（wos_df の sell_through 列があれば参照）
             has_sell_through = 'sell_through' in wos_df.columns
