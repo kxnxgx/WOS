@@ -4,8 +4,32 @@ from datetime import datetime
 
 class Reporter:
     @staticmethod
-    def _prepare_move_df(move_df: pd.DataFrame) -> pd.DataFrame:
+    def _prepare_move_df(move_df: pd.DataFrame, format_unit: bool = True) -> pd.DataFrame:
         if move_df.empty: return move_df
+        
+        disp = move_df.copy()
+        
+        # 列順序を定義（A〜M列）
+        desired_cols = [
+            'priority', 'sku', 'item_name', 'color_name', 'sell_through',
+            'shipper', 'shipper_stock', 'shipper_post_wos',
+            'receiver', 'receiver_stock', 'move_qty', 'receiver_post_wos',
+            'reason'
+        ]
+        cols = [c for c in desired_cols if c in disp.columns]
+        disp = disp[cols]
+
+        # WOS値のフォーマット（例: 2.5週）
+        if format_unit:
+            if 'shipper_post_wos' in disp.columns:
+                disp['shipper_post_wos'] = disp['shipper_post_wos'].apply(
+                    lambda v: f"{v:.1f}週" if pd.notna(v) else "—"
+                )
+            if 'receiver_post_wos' in disp.columns:
+                disp['receiver_post_wos'] = disp['receiver_post_wos'].apply(
+                    lambda v: f"{v:.1f}週" if pd.notna(v) else "—"
+                )
+
         rename_dict = {
             'priority': '優先度',
             'sku': '商品コード',
@@ -14,13 +38,15 @@ class Reporter:
             'sell_through': '消化率(%)',
             'shipper': '出荷店舗',
             'shipper_stock': '出荷元在庫',
+            'shipper_post_wos': '出荷後WOS',
             'receiver': '受入店舗',
             'receiver_stock': '受入先在庫',
             'move_qty': '移動推奨数',
+            'receiver_post_wos': '受入後WOS',
             'reason': '理由'
         }
-        rename_dict = {k: v for k, v in rename_dict.items() if k in move_df.columns}
-        return move_df.rename(columns=rename_dict)
+        rename_dict = {k: v for k, v in rename_dict.items() if k in disp.columns}
+        return disp.rename(columns=rename_dict)
 
     @staticmethod
     def _wos_color(val, vmin, vmax):
@@ -468,6 +494,8 @@ class Reporter:
             <li><strong>消化率</strong>: 全期間累計売上数 ÷ 発注数（総計列）× 100</li>
             <li><strong>⭐ 優先集約</strong>: 消化率 ≥ {threshold:.0f}% の SKU（完売を狙う）</li>
             <li><strong>📦 通常集約</strong>: 消化率 &lt; {threshold:.0f}% または消化率データなし</li>
+            <li><strong>出荷後WOS</strong>: (出荷元現在庫 − 移動数) ÷ 出荷元の直近4週平均販売数</li>
+            <li><strong>受入後WOS</strong>: (受入先現在庫 ＋ 移動数) ÷ 受入先の直近4週平均販売数</li>
             <li><strong>出荷候補</strong>: SKUの全店舗平均WOSより高い店舗（在庫余剰）</li>
             <li><strong>受入候補</strong>: SKUの全店舗平均WOSより低い店舗（在庫不足）</li>
         </ul>

@@ -56,6 +56,11 @@ class ItemAllocator:
                 is_cont = wos_df.loc[wos_df['sku'] == sku, 'is_continuation'].iloc[0]
 
             for s in shippers:
+                s['current_stock'] = s['stock_qty']
+            for r in receivers:
+                r['current_stock'] = r['stock_qty']
+
+            for s in shippers:
                 if s['surplus'] <= 0: continue
                 
                 for r in receivers:
@@ -66,6 +71,12 @@ class ItemAllocator:
                     move_qty = math.ceil(move)
                     
                     if move_qty > 0:
+                        shipper_post_stock = s['current_stock'] - move_qty
+                        receiver_post_stock = r['current_stock'] + move_qty
+                        
+                        shipper_post_wos = round(shipper_post_stock / s['avg_sales_4w'], 1) if s['avg_sales_4w'] > 0 else None
+                        receiver_post_wos = round(receiver_post_stock / r['avg_sales_4w'], 1) if r['avg_sales_4w'] > 0 else None
+
                         reason = (
                             f"{s['store']}のWOSが{s['wos']:.1f}週、"
                             f"{r['store']}のWOSが{r['wos']:.1f}週"
@@ -85,12 +96,16 @@ class ItemAllocator:
                             'sell_through': sell_through_val if has_sell_through else None,
                             'shipper': s['store'],
                             'shipper_stock': s['stock_qty'],
+                            'shipper_post_wos': shipper_post_wos,
                             'receiver': r['store'],
                             'receiver_stock': r['stock_qty'],
                             'move_qty': move_qty,
+                            'receiver_post_wos': receiver_post_wos,
                             'reason': reason
                         })
                         
+                        s['current_stock'] -= move_qty
+                        r['current_stock'] += move_qty
                         s['surplus'] -= move
                         r['deficit'] -= move
                         
