@@ -110,3 +110,38 @@ class DataLoader:
             return result
         except Exception as e:
             raise RuntimeError(f"発注数データの読み込みに失敗しました: {e}")
+
+    def load_bulk_stock(self, ship_alloc_csv_path: str) -> pd.DataFrame:
+        """出荷予定振分CSVから自社リテールBULK在庫数を読み込む（H列: 列インデックス7）"""
+        print(f"出荷予定振分データを読み込んでいます: {ship_alloc_csv_path}")
+        try:
+            # 4行スキップしてデータ行を読み込み
+            df = pd.read_csv(ship_alloc_csv_path, header=None, skiprows=4, encoding='cp932', low_memory=False)
+
+            # [3]=商品コード(sku), [5]=Brand, [7]=BULK(bulk_stock)
+            sku_col = 3
+            brand_col = 5
+            bulk_col = 7
+
+            # ブランドが FRV / FJALLRAVEN のものを抽出
+            if brand_col < len(df.columns):
+                df = df[df[brand_col].astype(str).str.upper().str.contains('FRV|FJALLRAVEN', na=False)].copy()
+
+            result = df[[sku_col, bulk_col]].copy()
+            result.columns = ['sku', 'bulk_stock']
+
+            # SKUの整形
+            result = result[result['sku'].notna()].copy()
+            result['sku'] = result['sku'].astype(str).str.strip()
+            result = result[result['sku'] != 'nan'].copy()
+
+            # bulk_stock の数値変換
+            result['bulk_stock'] = pd.to_numeric(result['bulk_stock'], errors='coerce').fillna(0).astype(int)
+
+            # SKU ごとに合算
+            result = result.groupby('sku', as_index=False)['bulk_stock'].sum()
+
+            print(f"  -> 自社BULK在庫データ: {len(result)} SKU 読み込み完了（BULK在庫あり: {len(result[result['bulk_stock'] > 0])} SKU）")
+            return result
+        except Exception as e:
+            raise RuntimeError(f"出荷予定振分データの読み込みに失敗しました: {e}")

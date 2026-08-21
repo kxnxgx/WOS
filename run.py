@@ -75,6 +75,8 @@ def main():
     parser.add_argument("--order", type=str, default=None, help="発注数ExcelファイルのパスCSVパス（省略時は自動検索）")
     parser.add_argument("--next-order", type=str, default=None,
                         help="次シーズン発注数Excelのパス（省略時はFW発注数ファイルを自動検索）")
+    parser.add_argument("--ship-alloc", type=str, default=None,
+                        help="出荷予定振分CSVのパス（省略時は自動検索）")
     parser.add_argument("--threshold", type=float, default=80.0,
                         help="消化率の優先集約閾値 %% (デフォルト: 80.0)")
     args = parser.parse_args()
@@ -136,6 +138,17 @@ def main():
             next_order_path = found_next
             print(f"[自動検索] 次シーズン発注数データを検出しました: {os.path.basename(next_order_path)}")
 
+    # --- 出荷予定振分データのパス解決（自社BULK在庫用・任意）---
+    ship_alloc_path = None
+    if hasattr(args, 'ship_alloc') and args.ship_alloc:
+        ship_alloc_path = args.ship_alloc
+        print(f"[指定] 出荷予定振分データ: {os.path.basename(ship_alloc_path)}")
+    else:
+        found_alloc = find_latest_csv("出荷予定振分")
+        if found_alloc:
+            ship_alloc_path = found_alloc
+            print(f"[自動検索] 出荷予定振分データを検出しました: {os.path.basename(ship_alloc_path)}")
+
     # 除外対象店舗リスト（WOS計算・移動推奨・ヒートマップ対象外）
     # ※全社の消化率計算（累計売上）には含まれます。
     EXCLUDE_STORES = ['6142']
@@ -160,11 +173,17 @@ def main():
         if next_order_path and os.path.exists(next_order_path):
             next_order_df = loader.load_order_data(next_order_path)
 
-        # 2. WOS計算（+ 消化率・継続品判定・店舗除外）
+        # 出荷予定振分データ（自社BULK在庫用・任意）
+        bulk_df = None
+        if ship_alloc_path and os.path.exists(ship_alloc_path):
+            bulk_df = loader.load_bulk_stock(ship_alloc_path)
+
+        # 2. WOS計算（+ 消化率・継続品判定・BULK在庫・店舗除外）
         wos_df = WOSCalculator.calculate(
             sales_df, stock_df,
             order_df=order_df,
             next_order_df=next_order_df,
+            bulk_df=bulk_df,
             exclude_stores=EXCLUDE_STORES
         )
 

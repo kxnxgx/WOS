@@ -6,6 +6,7 @@ class WOSCalculator:
     def calculate(sales_df: pd.DataFrame, stock_df: pd.DataFrame,
                   order_df: pd.DataFrame = None,
                   next_order_df: pd.DataFrame = None,
+                  bulk_df: pd.DataFrame = None,
                   exclude_stores: list = None) -> pd.DataFrame:
         """
         売上データと在庫データから、SKU・店舗ごとのWOSを計算する
@@ -18,17 +19,17 @@ class WOSCalculator:
 
         継続品（next_order_dfがある場合）:
         次シーズンの発注がある商品は is_continuation = True
+
+        BULK在庫（bulk_dfがある場合）:
+        出荷予定振分CSVから読み込んだ自社リテールBULK在庫数
         """
         print("WOSを計算しています...")
         
         if sales_df.empty or stock_df.empty:
             raise ValueError("売上データまたは在庫データが空です。")
 
-        # BULK（倉庫）在庫の抽出（SKUごとの合計在庫数）
+        # 在庫データ内のバルク（他社分を含むため店舗間移動から除外）
         bulk_mask = stock_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False)
-        bulk_df = stock_df[bulk_mask].groupby('sku')['stock_qty'].sum().reset_index()
-        bulk_df.columns = ['sku', 'bulk_stock']
-        print(f"BULK（倉庫）在庫データ: {len(bulk_df)} SKU 検出")
 
         # 除外店舗のフィルタリング（WOS計算・移動推奨・ヒートマップ対象外）
         # ※バルク（倉庫）も店舗間移動の対象外として除外
@@ -123,8 +124,11 @@ class WOSCalculator:
             wos_df['is_continuation'] = False
 
         # --- BULK在庫の結合 ---
-        wos_df = pd.merge(wos_df, bulk_df, on='sku', how='left')
-        wos_df['bulk_stock'] = wos_df['bulk_stock'].fillna(0).astype(int)
+        if bulk_df is not None and not bulk_df.empty:
+            wos_df = pd.merge(wos_df, bulk_df, on='sku', how='left')
+            wos_df['bulk_stock'] = wos_df['bulk_stock'].fillna(0).astype(int)
+        else:
+            wos_df['bulk_stock'] = 0
 
         return wos_df
 
