@@ -8,12 +8,13 @@ class Reporter:
         if move_df.empty: return move_df
         
         disp = move_df.copy()
-        
-        # 列順序を定義（A〜O列）
+
+        # 列順序を定義（A〜O列：出荷側 ➔ 移動推奨数 ➔ 受入側）
         desired_cols = [
             'priority', 'sku', 'item_name', 'color_name', 'sell_through',
             'shipper', 'shipper_stock', 'shipper_pre_wos', 'shipper_post_wos',
-            'receiver', 'receiver_stock', 'move_qty', 'receiver_pre_wos', 'receiver_post_wos',
+            'move_qty',
+            'receiver', 'receiver_stock', 'receiver_pre_wos', 'receiver_post_wos',
             'reason'
         ]
         cols = [c for c in desired_cols if c in disp.columns]
