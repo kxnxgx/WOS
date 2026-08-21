@@ -77,3 +77,36 @@ class DataLoader:
             return result
         except Exception as e:
             raise RuntimeError(f"在庫データの読み込みに失敗しました: {e}")
+
+    def load_order_data(self, order_xlsx_path: str) -> pd.DataFrame:
+        """発注数データを読み込む（消化率計算用）"""
+        print(f"発注数データを読み込んでいます: {order_xlsx_path}")
+        try:
+            df = pd.read_excel(order_xlsx_path, header=0)
+
+            # 列インデックスで取得（FRV発注数ファイルの列構成に合わせる）
+            # [0]=品コード(sku), [11]=計(total_order)
+            sku_col = df.columns[0]
+            total_col = df.columns[11]
+
+            result = df[[sku_col, total_col]].copy()
+            result.columns = ['sku', 'total_order']
+
+            # SKUが空またはNaNの行を除外（ヘッダー行などを除去）
+            result = result[result['sku'].notna()].copy()
+            result['sku'] = result['sku'].astype(str).str.strip()
+            result = result[result['sku'] != 'nan'].copy()
+
+            # total_order を数値変換
+            result['total_order'] = pd.to_numeric(result['total_order'], errors='coerce').fillna(0).astype(int)
+
+            # 発注数が0の行は除外（消化率計算の分母がゼロになるため）
+            result = result[result['total_order'] > 0].copy()
+
+            # SKU の重複がある場合は合計する（念のため）
+            result = result.groupby('sku', as_index=False)['total_order'].sum()
+
+            print(f"  -> 発注数データ: {len(result)} SKU 読み込み完了")
+            return result
+        except Exception as e:
+            raise RuntimeError(f"発注数データの読み込みに失敗しました: {e}")
