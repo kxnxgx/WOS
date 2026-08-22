@@ -1,17 +1,24 @@
 """
 create_shipping_report.py
 -------------------------
-WOS_Report.xlsx から目星（黄色ハイライト）を読み取り、
-バックアップを作成の上、店舗出荷指示に特化した「WOS_Report_店舗出荷.xlsx」を生成するスクリプト。
+最新の目星データをもとに、新アルゴリズム（通年WOS補完＋滞留回収＋1便5点おまとめ＋NARITA閉店ルール）
+を適用して「WOS_Report_店舗出荷.xlsx」を生成するスクリプト。
 """
 
 import os
-import shutil
 import sys
+import shutil
+import math
+import numpy as np
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+
+# ローカルモジュールインポート
+from src.data_loader import DataLoader
+from src.wos_calculator import WOSCalculator
+from src.item_allocator import ItemAllocator
 
 # 店舗名正規化マッピング
 STORE_NAME_MAP = {
@@ -46,10 +53,10 @@ def normalize_store(name):
     s = str(name).strip()
     return STORE_NAME_MAP.get(s, s)
 
-def load_data_from_excel(filepath):
-    """Excelから優先集約リストと通常集約リストを読み込み、黄色ハイライト行を特定する"""
+def load_selected_keys_from_excel(filepath):
+    """Excelの元ファイルからユーザーが黄色ハイライトした行の (SKU, 出荷店舗, 受入店舗) の組み合わせを読み取る"""
     wb = openpyxl.load_workbook(filepath, data_only=True)
-    records = []
+    selected_keys = set()
 
     for sheet_name in ['⭐優先集約リスト', '📦通常集約リスト']:
         if sheet_name not in wb.sheetnames:
@@ -57,14 +64,14 @@ def load_data_from_excel(filepath):
         ws = wb[sheet_name]
         headers = [cell.value for cell in ws[1]]
         
+        # ヘッダー位置の特定
+        sku_col = headers.index('商品コード') + 1 if '商品コード' in headers else 2
+        ship_col = headers.index('出荷店舗') + 1 if '出荷店舗' in headers else 7
+        recv_col = headers.index('受入店舗') + 1 if '受入店舗' in headers else 12
+
         for r in range(2, ws.max_row + 1):
             row_cells = ws[r]
-            row_dict = {}
-            for h, cell in zip(headers, row_cells):
-                if h:
-                    row_dict[h] = cell.value
-
-            # 黄色ハイライトの判定（ユーザー指定の FFFFFF00 やその他明示的黄色）
+            # 黄色ハイライトの判定
             is_yellow = False
             for cell in row_cells:
                 if cell.fill and cell.fill.fill_type:
@@ -74,37 +81,31 @@ def load_data_from_excel(filepath):
                         is_yellow = True
                         break
             
-            row_dict['is_selected'] = is_yellow
-            row_dict['original_sheet'] = sheet_name
-            records.append(row_dict)
+            if is_yellow:
+                sku = str(ws.cell(row=r, column=sku_col).value).strip()
+                ship = normalize_store(ws.cell(row=r, column=ship_col).value)
+                recv = normalize_store(ws.cell(row=r, column=recv_col).value)
+                if sku and ship and recv:
+                    selected_keys.add((sku, ship, recv))
 
-    df = pd.DataFrame(records)
-    
-    # 店舗名の正規化
-    if '出荷店舗' in df.columns:
-        df['出荷店舗'] = df['出荷店舗'].apply(normalize_store)
-    if '受入店舗' in df.columns:
-        df['受入店舗'] = df['受入店舗'].apply(normalize_store)
-
-    return df
+    return selected_keys
 
 def setup_styles():
-    """各種セルの書式スタイルを定義"""
     font_main = Font(name='Meiryo UI', size=9)
     font_bold = Font(name='Meiryo UI', size=9, bold=True)
     font_title = Font(name='Meiryo UI', size=13, bold=True, color='1F4E79')
     font_subtitle = Font(name='Meiryo UI', size=9.5, bold=True, color='595959')
     font_header = Font(name='Meiryo UI', size=9, bold=True, color='FFFFFF')
 
-    fill_header_navy = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid') # 統合リスト用
-    fill_header_blue = PatternFill(start_color='2E75B6', end_color='2E75B6', fill_type='solid') # 店舗出荷用
-    fill_header_summary = PatternFill(start_color='333F48', end_color='333F48', fill_type='solid') # サマリー用
+    fill_header_navy = PatternFill(start_color='1F4E79', end_color='1F4E79', fill_type='solid') 
+    fill_header_blue = PatternFill(start_color='2E75B6', end_color='2E75B6', fill_type='solid') 
+    fill_header_summary = PatternFill(start_color='333F48', end_color='333F48', fill_type='solid') 
 
-    fill_yellow_selected = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid') # 選定行
-    fill_cont_blue = PatternFill(start_color='E6F2FF', end_color='E6F2FF', fill_type='solid') # 継続品
-    fill_bulk_orange = PatternFill(start_color='FFEAA7', end_color='FFEAA7', fill_type='solid') # BULK在庫
-    fill_highlight_qty = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid') # サマリー強調
-    fill_total_row = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid') # 合計行
+    fill_yellow_selected = PatternFill(start_color='FFF2CC', end_color='FFF2CC', fill_type='solid') 
+    fill_cont_blue = PatternFill(start_color='E6F2FF', end_color='E6F2FF', fill_type='solid') 
+    fill_bulk_orange = PatternFill(start_color='FFEAA7', end_color='FFEAA7', fill_type='solid') 
+    fill_highlight_qty = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid') 
+    fill_total_row = PatternFill(start_color='F2F2F2', end_color='F2F2F2', fill_type='solid') 
 
     thin_border_side = Side(border_style='thin', color='D9D9D9')
     border_all_thin = Border(left=thin_border_side, right=thin_border_side, top=thin_border_side, bottom=thin_border_side)
@@ -115,7 +116,6 @@ def setup_styles():
     align_center = Alignment(horizontal='center', vertical='center')
     align_left = Alignment(horizontal='left', vertical='center')
     align_right = Alignment(horizontal='right', vertical='center')
-    align_wrap_left = Alignment(horizontal='left', vertical='center', wrap_text=True)
 
     return {
         'font_main': font_main,
@@ -136,16 +136,218 @@ def setup_styles():
         'align_center': align_center,
         'align_left': align_left,
         'align_right': align_right,
-        'align_wrap_left': align_wrap_left,
     }
 
-def build_shipping_summary_sheet(wb, df_selected, styles):
+def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
+    """通年WOS補完＋滞留回収＋NARITA閉店ルールを組み込んだ新規マッチングロジック"""
+    exclude_strs = [str(s).strip() for s in exclude_stores]
+    bulk_mask = stock_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False)
+    stock_valid = stock_df[(~stock_df['store'].astype(str).str.strip().isin(exclude_strs)) & (~bulk_mask)].copy()
+    sales_valid = sales_df[(~sales_df['store'].astype(str).str.strip().isin(exclude_strs)) & (~sales_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False))].copy()
+
+    # 全期間の日数・週数
+    min_date = sales_valid['date'].min()
+    max_date = sales_valid['date'].max()
+    total_weeks = max(1.0, (max_date - min_date).days / 7.0)
+
+    # 1. 通年売上
+    annual_sales = sales_valid.groupby(['store', 'sku'])['sales_qty'].sum().reset_index()
+    annual_sales['annual_weekly_sales'] = annual_sales['sales_qty'] / total_weeks
+
+    # 2. 直近4週売上
+    cutoff_28d = max_date - pd.Timedelta(days=28)
+    recent_sales_df = sales_valid[sales_valid['date'] > cutoff_28d]
+    recent_sales = recent_sales_df.groupby(['store', 'sku'])['sales_qty'].sum().reset_index()
+    recent_sales['recent_weekly_sales'] = recent_sales['sales_qty'] / 4.0
+
+    # 3. マージ
+    all_combos = pd.merge(stock_valid[['store', 'sku']], annual_sales[['store', 'sku']], on=['store', 'sku'], how='outer').drop_duplicates()
+    wos_new = pd.merge(all_combos, stock_valid, on=['store', 'sku'], how='left')
+    wos_new = pd.merge(wos_new, annual_sales[['store', 'sku', 'sales_qty', 'annual_weekly_sales']], on=['store', 'sku'], how='left').rename(columns={'sales_qty': 'annual_sales'})
+    wos_new = pd.merge(wos_new, recent_sales[['store', 'sku', 'recent_weekly_sales']], on=['store', 'sku'], how='left')
+
+    wos_new['stock_qty'] = wos_new['stock_qty'].fillna(0)
+    wos_new['annual_sales'] = wos_new['annual_sales'].fillna(0)
+    wos_new['annual_weekly_sales'] = wos_new['annual_weekly_sales'].fillna(0)
+    wos_new['recent_weekly_sales'] = wos_new['recent_weekly_sales'].fillna(0)
+
+    # 消化率
+    if order_df is not None and not order_df.empty:
+        cum_sales = sales_df.groupby('sku')['sales_qty'].sum().reset_index().rename(columns={'sales_qty': 'cum_sales'})
+        ord_clean = order_df.rename(columns={order_df.columns[0]: 'sku', order_df.columns[1]: 'total_order'})
+        st_df = pd.merge(cum_sales, ord_clean, on='sku', how='left')
+        st_df['sell_through'] = np.where(st_df['total_order'] > 0, (st_df['cum_sales'] / st_df['total_order']) * 100, np.nan)
+        wos_new = pd.merge(wos_new, st_df[['sku', 'sell_through']], on='sku', how='left')
+
+    # 商品マスタ
+    master = sales_df[['sku', 'item_name', 'color_name']].drop_duplicates('sku')
+    wos_new = pd.merge(wos_new, master, on='sku', how='left')
+
+    # 継続品
+    wos_new['is_continuation'] = False
+
+    # BULK在庫
+    wos_new['bulk_stock'] = 0
+
+    # 実効WOSと週販の算出
+    def calc_effective(row):
+        stk = row['stock_qty']
+        r_spd = row['recent_weekly_sales']
+        a_spd = row['annual_weekly_sales']
+        if r_spd > 0:
+            return pd.Series([r_spd, stk / r_spd, '直近4週'])
+        elif a_spd > 0:
+            return pd.Series([a_spd, stk / a_spd, '通年補完'])
+        elif stk > 0:
+            return pd.Series([0.0, 999.0, '完全滞留'])
+        else:
+            return pd.Series([0.0, np.nan, '在庫なし'])
+
+    wos_new[['effective_speed', 'effective_wos', 'wos_basis']] = wos_new.apply(calc_effective, axis=1)
+
+    move_records = []
+    all_skus = wos_new['sku'].unique()
+    from src.item_allocator import ItemAllocator
+
+    for sku in all_skus:
+        stores = wos_new[wos_new['sku'] == sku]
+        valid = stores[(stores['stock_qty'] > 0) | (stores['effective_speed'] > 0)].copy()
+        if valid.empty: continue
+
+        active_stores = valid[valid['effective_wos'] < 900]
+        wos_avg = active_stores['effective_wos'].mean() if not active_stores.empty else 4.0
+
+        shippers_list = []
+        receivers_list = []
+
+        for _, row in valid.iterrows():
+            st_name = str(row['store'])
+            is_narita = 'NARITA' in st_name
+            stk = row['stock_qty']
+            r_spd = row['recent_weekly_sales']
+            eff_spd = row['effective_speed']
+            eff_wos = row['effective_wos']
+
+            if is_narita:
+                # NARITA（閉店段階的撤退）
+                if stk > 0:
+                    keep_qty = math.ceil(r_spd * 2.0) if r_spd > 0 else 0
+                    surplus = max(0, stk - keep_qty)
+                    if surplus > 0:
+                        r_dict = row.to_dict()
+                        r_dict['surplus'] = surplus
+                        shippers_list.append(r_dict)
+                elif stk == 0 and r_spd >= 0.5:
+                    deficit = min(2, math.ceil(r_spd * 2.0))
+                    r_dict = row.to_dict()
+                    r_dict['deficit'] = deficit
+                    receivers_list.append(r_dict)
+            else:
+                # 通常店舗
+                if stk > 0 and (eff_wos > wos_avg or eff_wos >= 900):
+                    surplus = stk if eff_wos >= 900 else (stk - (wos_avg * eff_spd))
+                    if surplus > 0:
+                        r_dict = row.to_dict()
+                        r_dict['surplus'] = surplus
+                        shippers_list.append(r_dict)
+                elif eff_wos < wos_avg and eff_spd > 0:
+                    deficit = (wos_avg * eff_spd) - stk
+                    if deficit > 0:
+                        r_dict = row.to_dict()
+                        r_dict['deficit'] = deficit
+                        receivers_list.append(r_dict)
+
+        if not shippers_list or not receivers_list:
+            continue
+
+        shippers_df = pd.DataFrame(shippers_list).sort_values('surplus', ascending=False)
+        receivers_df = pd.DataFrame(receivers_list)
+        receivers_df['store_rank'] = receivers_df['store'].apply(ItemAllocator._get_store_priority_rank)
+        receivers_df = receivers_df.sort_values(by=['deficit', 'store_rank'], ascending=[False, True])
+
+        shippers_dicts = shippers_df.to_dict('records')
+        receivers_dicts = receivers_df.to_dict('records')
+
+        st_val = stores['sell_through'].iloc[0] if 'sell_through' in stores.columns else np.nan
+        priority = "優先" if pd.notna(st_val) and st_val >= 80.0 else "通常"
+
+        for s in shippers_dicts:
+            s['cur_stk'] = s['stock_qty']
+        for r in receivers_dicts:
+            r['cur_stk'] = r['stock_qty']
+
+        for s in shippers_dicts:
+            if s['surplus'] <= 0 or s['cur_stk'] <= 0: continue
+            for r in receivers_dicts:
+                if r['deficit'] <= 0: continue
+                if s['surplus'] <= 0 or s['cur_stk'] <= 0: break
+
+                move = min(s['surplus'], r['deficit'])
+                candidate_qty = max(1, math.ceil(move))
+                move_qty = min(candidate_qty, int(s['cur_stk']))
+
+                if move_qty > 0:
+                    s['cur_stk'] -= move_qty
+                    r['cur_stk'] += move_qty
+                    s['surplus'] -= move_qty
+                    r['deficit'] -= move_qty
+
+                    # WOS表記の調整
+                    s_pre_wos = f"{s['stock_qty'] / s['recent_weekly_sales']:.1f}週" if s['recent_weekly_sales'] > 0 else "—"
+                    s_post_wos = f"{s['cur_stk'] / s['recent_weekly_sales']:.1f}週" if s['recent_weekly_sales'] > 0 else "—"
+                    r_pre_wos = f"{r['stock_qty'] / r['recent_weekly_sales']:.1f}週" if r['recent_weekly_sales'] > 0 else "—"
+                    r_post_wos = f"{r['cur_stk'] / r['recent_weekly_sales']:.1f}週" if r['recent_weekly_sales'] > 0 else "—"
+
+                    reason = (
+                        f"{s['store']}のWOSが{s_pre_wos}（{s['wos_basis']}）、"
+                        f"{r['store']}のWOSが{r_pre_wos}（{r['wos_basis']}）のため、"
+                        f"{s['store']}から{r['store']}へ{move_qty}点移動を推奨"
+                    )
+
+                    move_records.append({
+                        'priority': priority,
+                        'is_continuation': False,
+                        'sku': sku,
+                        'item_name': s.get('item_name', ''),
+                        'color_name': s.get('color_name', ''),
+                        'bulk_stock': 0,
+                        'sell_through': st_val,
+                        'shipper': s['store'],
+                        'shipper_stock': s['stock_qty'],
+                        'shipper_pre_wos': s_pre_wos,
+                        'shipper_post_wos': s_post_wos,
+                        'move_qty': move_qty,
+                        'receiver': r['store'],
+                        'receiver_stock': r['stock_qty'],
+                        'receiver_pre_wos': r_pre_wos,
+                        'receiver_post_wos': r_post_wos,
+                        'reason': reason
+                    })
+
+    df_moves = pd.DataFrame(move_records)
+    
+    # 店舗名正規化
+    df_moves['shipper_norm'] = df_moves['shipper'].apply(normalize_store)
+    df_moves['receiver_norm'] = df_moves['receiver'].apply(normalize_store)
+
+    # 1便5点以上のおまとめ最適化
+    route_totals = df_moves.groupby(['shipper_norm', 'receiver_norm'])['move_qty'].sum().reset_index().rename(columns={'move_qty': 'route_qty'})
+    df_merged = pd.merge(df_moves, route_totals, on=['shipper_norm', 'receiver_norm'], how='left')
+    
+    # おまとめ適用後のDF
+    df_opt = df_merged[df_merged['route_qty'] >= 5].copy()
+    df_opt['shipper'] = df_opt['shipper_norm']
+    df_opt['receiver'] = df_opt['receiver_norm']
+    df_opt = df_opt.drop(columns=['shipper_norm', 'receiver_norm', 'route_qty'])
+    
+    return df_opt
+
+def build_shipping_summary_sheet(ws, df_selected, styles):
     """シート1: 📋店舗別出荷サマリー の作成"""
-    ws = wb.create_sheet(title='📋店舗別出荷サマリー', index=0)
     ws.views.sheetView[0].showGridLines = True
 
     # タイトル
-    ws['B2'] = "【店舗間移動 出荷・受入サマリー（選定アイテム計40件）】"
+    ws['B2'] = f"【店舗間移動 出荷・受入サマリー（選定アイテム計{len(df_selected)}件）】"
     ws['B2'].font = styles['font_title']
     ws['B3'] = "※各店舗が出荷する点数および受入店舗の内訳一覧です。"
     ws['B3'].font = styles['font_subtitle']
@@ -170,7 +372,6 @@ def build_shipping_summary_sheet(wb, df_selected, styles):
         cell.alignment = styles['align_center']
         cell.border = styles['border_all_thin']
 
-    # 出荷合計列ヘッダー
     total_col_idx = start_col + len(ALL_STORES) + 1
     cell = ws.cell(row=start_row, column=total_col_idx, value="出荷合計点数")
     cell.font = styles['font_header']
@@ -178,7 +379,6 @@ def build_shipping_summary_sheet(wb, df_selected, styles):
     cell.alignment = styles['align_center']
     cell.border = styles['border_all_thin']
 
-    # アイテム件数列ヘッダー
     item_col_idx = total_col_idx + 1
     cell = ws.cell(row=start_row, column=item_col_idx, value="選定アイテム数")
     cell.font = styles['font_header']
@@ -239,7 +439,7 @@ def build_shipping_summary_sheet(wb, df_selected, styles):
         if col_total_qty > 0:
             cell.fill = styles['fill_yellow_selected']
 
-    # 総合計点数
+    # 総合計
     grand_total_cell = ws.cell(row=bottom_row, column=total_col_idx, value=grand_total_qty)
     grand_total_cell.font = Font(name='Meiryo UI', size=11, bold=True, color='C00000')
     grand_total_cell.alignment = styles['align_center']
@@ -253,20 +453,19 @@ def build_shipping_summary_sheet(wb, df_selected, styles):
     total_items_cell.fill = styles['fill_yellow_selected']
     total_items_cell.border = styles['border_total_row']
 
-    # 列幅調整
     ws.column_dimensions['A'].width = 3
     ws.column_dimensions['B'].width = 24
     for c_idx in range(start_col + 1, total_col_idx + 2):
         col_letter = get_column_letter(c_idx)
         ws.column_dimensions[col_letter].width = 16
 
-def build_merged_summary_sheet(wb, df_all, styles):
+def build_merged_summary_sheet(ws, df_all, selected_keys, styles):
     """シート2: 📋統合集約リスト の作成"""
-    ws = wb.create_sheet(title='📋統合集約リスト', index=1)
     ws.views.sheetView[0].showGridLines = True
 
-    # ソート：優先度（優先➔通常）＋ 消化率降順（NaN末尾）
+    # 優先度順（優先➔通常）＋ 消化率降順
     df_sorted = df_all.copy()
+    selected_skus = set(k[0] for k in selected_keys)
     df_sorted['priority_rank'] = df_sorted['優先度'].apply(lambda x: 0 if x == '優先' else 1)
     df_sorted['st_num'] = pd.to_numeric(df_sorted['消化率(%)'], errors='coerce')
     df_sorted = df_sorted.sort_values(by=['priority_rank', 'st_num'], ascending=[True, False]).drop(columns=['priority_rank', 'st_num'])
@@ -288,10 +487,9 @@ def build_merged_summary_sheet(wb, df_all, styles):
         ('受入先在庫', 12, 'right'),
         ('受入前WOS', 12, 'right'),
         ('受入後WOS', 12, 'right'),
-        ('理由', 50, 'left')
+        ('理由', 55, 'left')
     ]
 
-    # ヘッダー書き込み
     for col_idx, (col_name, col_width, align) in enumerate(columns, start=1):
         cell = ws.cell(row=1, column=col_idx, value=col_name)
         cell.font = styles['font_header']
@@ -301,9 +499,14 @@ def build_merged_summary_sheet(wb, df_all, styles):
         col_letter = get_column_letter(col_idx)
         ws.column_dimensions[col_letter].width = col_width
 
-    # データ行書き込み
     for row_idx, (_, row_data) in enumerate(df_sorted.iterrows(), start=2):
-        is_sel = bool(row_data.get('is_selected', False))
+        sku = str(row_data.get('商品コード', '')).strip()
+        ship = normalize_store(row_data.get('出荷店舗', ''))
+        recv = normalize_store(row_data.get('受入店舗', ''))
+        
+        # ユーザー選定キーと一致するか判定
+        is_sel = sku in selected_skus
+        
         item_name = str(row_data.get('商品名', ''))
         is_cont = '🔄' in item_name
         bulk_val = row_data.get('BULK在庫', 0)
@@ -330,7 +533,6 @@ def build_merged_summary_sheet(wb, df_all, styles):
             cell.font = styles['font_bold'] if is_sel and col_name in ('選定対象', '移動推奨数', '出荷店舗', '受入店舗') else styles['font_main']
             cell.border = styles['border_all_thin']
 
-            # アライメント
             if align == 'center':
                 cell.alignment = styles['align_center']
             elif align == 'right':
@@ -338,15 +540,12 @@ def build_merged_summary_sheet(wb, df_all, styles):
             else:
                 cell.alignment = styles['align_left']
 
-            # 背景色
             if row_fill:
                 cell.fill = row_fill
 
-            # BULK在庫が > 0 の場合の強調
             if col_name == 'BULK在庫' and bulk_qty > 0:
                 cell.fill = styles['fill_bulk_orange']
 
-            # 選定対象列の文字色
             if col_name == '選定対象' and is_sel:
                 cell.font = Font(name='Meiryo UI', size=11, bold=True, color='C00000')
 
@@ -396,7 +595,6 @@ def build_store_shipping_sheets(wb, df_selected, styles):
         ws = wb.create_sheet(title=sheet_title)
         ws.views.sheetView[0].showGridLines = True
 
-        # タイトル情報
         ws['A1'] = f"【出荷指示書】 {store_name} ➔ 各受入店舗"
         ws['A1'].font = styles['font_title']
         tot_qty_val = int(store_df['移動推奨数'].sum()) if not store_df.empty else 0
@@ -495,41 +693,85 @@ def main():
     if sys.platform == 'win32':
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
+    source_file = "WOS_Report_元データ.xlsx"
     output_file = "WOS_Report_店舗出荷.xlsx"
-
-    # WOS_Report_元データ.xlsx と WOS_Report.xlsx のうち、最新のものをソースとして使用
-    candidates = ["WOS_Report_元データ.xlsx", "WOS_Report.xlsx"]
-    valid_candidates = [f for f in candidates if os.path.exists(f)]
-    if not valid_candidates:
-        print("エラー: 元データファイルが見つかりません。")
-        return
-
-    # 最新の更新日時を持つファイルを選択
-    source_file = max(valid_candidates, key=os.path.getmtime)
 
     print("=== WOS 店舗別出荷指示レポート生成処理 開始 ===")
     print(f"データ読み込み元: {source_file}")
 
-    df_all = load_data_from_excel(source_file)
-    df_selected = df_all[df_all['is_selected'] == True].copy()
+    # 1. ユーザー選定キー（目星の黄色行）を読み込む
+    selected_keys = load_selected_keys_from_excel(source_file)
+    print(f"ユーザー選定キー数: {len(selected_keys)} 件")
 
-    print(f"全体アイテム数: {len(df_all)} 件")
-    print(f"ユーザー選定（黄色ハイライト）アイテム数: {len(df_selected)} 件")
-    print(f"  - 優先: {len(df_selected[df_selected['優先度'] == '優先'])} 件")
-    print(f"  - 通常: {len(df_selected[df_selected['優先度'] != '優先'])} 件")
-    print(f"総出荷推奨数: {df_selected['移動推奨数'].sum()} 点")
+    # 2. 新アルゴリズムによる全提案候補の計算
+    sales_csv = '営業日付別売上分析(旧) (18).csv'
+    stock_csv = '在庫一覧 (7).csv'
+    order_ss = 'FRV26SS発注数.xlsx'
+    
+    loader = DataLoader(sales_csv, stock_csv)
+    sales = loader.load_sales_history()
+    stock = loader.load_current_stock()
+    order_df = loader.load_order_data(order_ss)
 
+    exclude_stores = [
+        '6142', 'FJALLRAVEN POP-UP', 'FJALLRAVEN by 3NITY', 'FJALLRAVEN by 3NITY POPUP',
+        'New Way-A', 'New Way-B', 'New Way-C', 'New Way-G', 'ZOZO', 'テスト店舗',
+        'バルク', '丸井ｳｪﾌﾞﾁｬﾝﾈﾙ', 'ﾕﾆﾌｫｰﾑ ﾙｸｱ大阪', 'ﾕﾆﾌｫｰﾑNODE', 'ﾕﾆﾌｫｰﾑTOKYO',
+        'ﾕﾆﾌｫｰﾑ京王新宿', 'ﾕﾆﾌｫｰﾑ名古屋', 'ﾕﾆﾌｫｰﾑ大丸心斎橋', 'ﾕﾆﾌｫｰﾑ本社', 'ﾕﾆﾌｫｰﾑ玉川高島屋'
+    ]
+
+    # 新アルゴリズムの実行（通年WOS補完＋滞留回収＋NARITA閉店段階的撤退＋1便5点おまとめ）
+    df_all_moves = calculate_new_moves(sales, stock, order_df, exclude_stores)
+    print(f"新アルゴリズム総移動提案候補: {len(df_all_moves)} 件")
+
+    # 日本語カラム名にリネームして統合リスト形式にする
+    rename_cols = {
+        'priority': '優先度',
+        'sku': '商品コード',
+        'item_name': '商品名',
+        'color_name': 'カラー',
+        'bulk_stock': 'BULK在庫',
+        'sell_through': '消化率(%)',
+        'shipper': '出荷店舗',
+        'shipper_stock': '出荷元在庫',
+        'shipper_pre_wos': '出荷前WOS',
+        'shipper_post_wos': '出荷後WOS',
+        'move_qty': '移動推奨数',
+        'receiver': '受入店舗',
+        'receiver_stock': '受入先在庫',
+        'receiver_pre_wos': '受入前WOS',
+        'receiver_post_wos': '受入後WOS',
+        'reason': '理由'
+    }
+    df_all_display = df_all_moves.rename(columns=rename_cols)
+
+    # 3. ユーザー選定行（目星行）のみを抽出
+    selected_skus = set(k[0] for k in selected_keys)
+    
+    def is_selected_row(row):
+        sku = str(row['商品コード']).strip()
+        return sku in selected_skus
+
+    df_selected = df_all_display[df_all_display.apply(is_selected_row, axis=1)].copy()
+    print(f"選定された出荷対象行: {len(df_selected)} 件 (総出荷数: {df_selected['移動推奨数'].sum()} 点)")
+
+    # 4. 新規Workbookの構築
     wb = openpyxl.Workbook()
     default_sheet = wb.active
 
     styles = setup_styles()
 
-    print("生成中: 店舗別出荷サマリー シート")
-    build_shipping_summary_sheet(wb, df_selected, styles)
+    # シート1: 📋店舗別出荷サマリー
+    print("生成中: 📋店舗別出荷サマリー シート")
+    ws_sum = wb.create_sheet(title='📋店舗別出荷サマリー', index=0)
+    build_shipping_summary_sheet(ws_sum, df_selected, styles)
 
-    print("生成中: 統合集約リスト シート")
-    build_merged_summary_sheet(wb, df_all, styles)
+    # シート2: 📋統合集約リスト
+    print("生成中: 📋統合集約リスト シート")
+    ws_merged = wb.create_sheet(title='📋統合集約リスト', index=1)
+    build_merged_summary_sheet(ws_merged, df_all_display, selected_keys, styles)
 
+    # シート3〜11: 出荷_<店舗名>
     print("生成中: 各店舗別出荷シート（全9店舗）")
     build_store_shipping_sheets(wb, df_selected, styles)
 
