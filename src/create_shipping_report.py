@@ -693,7 +693,7 @@ def main():
     if sys.platform == 'win32':
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
 
-    source_file = "WOS_Report_元データ.xlsx"
+    source_file = "WOS_Report.xlsx"
     output_file = "WOS_Report_店舗出荷.xlsx"
 
     print("=== WOS 店舗別出荷指示レポート生成処理 開始 ===")
