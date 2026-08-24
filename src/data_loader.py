@@ -145,3 +145,36 @@ class DataLoader:
             return result
         except Exception as e:
             raise RuntimeError(f"出荷予定振分データの読み込みに失敗しました: {e}")
+
+    def load_item_master(self, master_csv_path: str = "商品マスタ.csv") -> pd.DataFrame:
+        """商品マスタCSVから商品コード、商品名（StyleName）、カラー名（ColorName）を読み込む"""
+        print(f"商品マスタデータを読み込んでいます: {master_csv_path}")
+        try:
+            df = pd.read_csv(master_csv_path, encoding='cp932', low_memory=False)
+
+            sku_col = '商品コード' if '商品コード' in df.columns else df.columns[0]
+            name_col = 'StyleName' if 'StyleName' in df.columns else df.columns[4]
+            color_col = 'ColorName' if 'ColorName' in df.columns else df.columns[6]
+            brand_col = 'Brand' if 'Brand' in df.columns else (df.columns[22] if len(df.columns) > 22 else None)
+
+            if brand_col and brand_col in df.columns:
+                # FRV / FJALLRAVEN のものを優先抽出
+                frv_df = df[df[brand_col].astype(str).str.upper().str.contains('FRV|FJALLRAVEN', na=False)].copy()
+                if not frv_df.empty:
+                    df = frv_df
+
+            result = df[[sku_col, name_col, color_col]].copy()
+            result.columns = ['sku', 'item_name', 'color_name']
+
+            result['sku'] = result['sku'].astype(str).str.strip()
+            result['item_name'] = result['item_name'].fillna('Unknown').astype(str).str.strip()
+            result['color_name'] = result['color_name'].fillna('Unknown').astype(str).str.strip()
+
+            result = result[result['sku'] != 'nan']
+            result = result.drop_duplicates(subset=['sku'])
+
+            print(f"  -> 商品マスタデータ: {len(result)} SKU 読み込み完了")
+            return result
+        except Exception as e:
+            print(f"  [警告] 商品マスタの読み込みに失敗しました ({e})。処理をスキップします。")
+            return pd.DataFrame(columns=['sku', 'item_name', 'color_name'])

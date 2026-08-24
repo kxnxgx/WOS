@@ -15,6 +15,9 @@ import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
+# プロジェクトルートを sys.path に追加して直接実行可能にする
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 # ローカルモジュールインポート
 from src.data_loader import DataLoader
 from src.wos_calculator import WOSCalculator
@@ -53,6 +56,35 @@ def normalize_store(name):
     s = str(name).strip()
     return STORE_NAME_MAP.get(s, s)
 
+def _is_yellow_fill(fill) -> bool:
+    """セルの背景色が黄色系（ハイライト）かどうかを堅牢に判定する"""
+    if not fill or not fill.fill_type or fill.fill_type == 'none':
+        return False
+
+    # fgColor と start_color の両方をチェック
+    for color_prop in [getattr(fill, 'fgColor', None), getattr(fill, 'start_color', None)]:
+        if not color_prop:
+            continue
+
+        # RGB 判定
+        rgb = getattr(color_prop, 'rgb', None)
+        if rgb:
+            rgb_str = str(rgb).upper()
+            if any(y_code in rgb_str for y_code in ('FFFF00', 'FFF2CC', 'FFEAA7', 'FEF08A', 'FDE047')):
+                return True
+
+        # Indexed カラー判定（Excel標準の黄色インデックスは 13 または 27）
+        if getattr(color_prop, 'type', None) == 'indexed':
+            if getattr(color_prop, 'indexed', None) in (13, 27, 34, 43):
+                return True
+
+        # テーマカラー値判定
+        if getattr(color_prop, 'type', None) == 'theme' and getattr(color_prop, 'value', None) is not None:
+            if str(color_prop.value).upper() in ('4', '5', '6', '7') and getattr(color_prop, 'tint', 0) > 0.3:
+                return True
+
+    return False
+
 def load_selected_keys_from_excel(filepath):
     """Excelの元ファイルからユーザーが黄色ハイライトした行の (SKU, 出荷店舗, 受入店舗) の組み合わせを読み取る"""
     wb = openpyxl.load_workbook(filepath, data_only=True)
@@ -72,20 +104,13 @@ def load_selected_keys_from_excel(filepath):
         for r in range(2, ws.max_row + 1):
             row_cells = ws[r]
             # 黄色ハイライトの判定
-            is_yellow = False
-            for cell in row_cells:
-                if cell.fill and cell.fill.fill_type:
-                    fg = cell.fill.fgColor
-                    rgb = getattr(fg, 'rgb', None)
-                    if rgb == 'FFFFFF00' or (rgb and 'FFFF00' in str(rgb)):
-                        is_yellow = True
-                        break
+            is_yellow = any(_is_yellow_fill(cell.fill) for cell in row_cells)
             
             if is_yellow:
-                sku = str(ws.cell(row=r, column=sku_col).value).strip()
+                sku = str(ws.cell(row=r, column=sku_col).value or '').strip()
                 ship = normalize_store(ws.cell(row=r, column=ship_col).value)
                 recv = normalize_store(ws.cell(row=r, column=recv_col).value)
-                if sku and ship and recv:
+                if sku and sku != 'None':
                     selected_keys.add((sku, ship, recv))
 
     return selected_keys
@@ -140,10 +165,8 @@ def setup_styles():
 
 def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
     """通年WOS補完＋滞留回収＋NARITA閉店ルールを組み込んだ新規マッチングロジック"""
-    exclude_strs = [str(s).strip() for s in exclude_stores]
-    bulk_mask = stock_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False)
-    stock_valid = stock_df[(~stock_df['store'].astype(str).str.strip().isin(exclude_strs)) & (~bulk_mask)].copy()
-    sales_valid = sales_df[(~sales_df['store'].astype(str).str.strip().isin(exclude_strs)) & (~sales_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False))].copy()
+    stock_valid = stock_df[~stock_df['store'].apply(lambda s: WOSCalculator.is_excluded_store(s, exclude_stores))].copy()
+    sales_valid = sales_df[~sales_df['store'].apply(lambda s: WOSCalculator.is_excluded_store(s, exclude_stores))].copy()
 
     # 全期間の日数・週数
     min_date = sales_valid['date'].min()
@@ -207,7 +230,6 @@ def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
 
     move_records = []
     all_skus = wos_new['sku'].unique()
-    from src.item_allocator import ItemAllocator
 
     for sku in all_skus:
         stores = wos_new[wos_new['sku'] == sku]
@@ -216,6 +238,8 @@ def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
 
         active_stores = valid[valid['effective_wos'] < 900]
         wos_avg = active_stores['effective_wos'].mean() if not active_stores.empty else 4.0
+        if pd.isna(wos_avg):
+            wos_avg = 4.0
 
         shippers_list = []
         receivers_list = []
@@ -232,28 +256,32 @@ def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
                 # NARITA（閉店段階的撤退）
                 if stk > 0:
                     keep_qty = math.ceil(r_spd * 2.0) if r_spd > 0 else 0
-                    surplus = max(0, stk - keep_qty)
+                    surplus = max(0.0, float(stk - keep_qty))
                     if surplus > 0:
                         r_dict = row.to_dict()
                         r_dict['surplus'] = surplus
+                        r_dict['deficit'] = 0.0
                         shippers_list.append(r_dict)
                 elif stk == 0 and r_spd >= 0.5:
-                    deficit = min(2, math.ceil(r_spd * 2.0))
+                    deficit = float(min(2, math.ceil(r_spd * 2.0)))
                     r_dict = row.to_dict()
+                    r_dict['surplus'] = 0.0
                     r_dict['deficit'] = deficit
                     receivers_list.append(r_dict)
             else:
                 # 通常店舗
                 if stk > 0 and (eff_wos > wos_avg or eff_wos >= 900):
-                    surplus = stk if eff_wos >= 900 else (stk - (wos_avg * eff_spd))
+                    surplus = float(stk if eff_wos >= 900 else (stk - (wos_avg * eff_spd)))
                     if surplus > 0:
                         r_dict = row.to_dict()
                         r_dict['surplus'] = surplus
+                        r_dict['deficit'] = 0.0
                         shippers_list.append(r_dict)
                 elif eff_wos < wos_avg and eff_spd > 0:
-                    deficit = (wos_avg * eff_spd) - stk
+                    deficit = float((wos_avg * eff_spd) - stk)
                     if deficit > 0:
                         r_dict = row.to_dict()
+                        r_dict['surplus'] = 0.0
                         r_dict['deficit'] = deficit
                         receivers_list.append(r_dict)
 
@@ -279,6 +307,7 @@ def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
         for s in shippers_dicts:
             if s['surplus'] <= 0 or s['cur_stk'] <= 0: continue
             for r in receivers_dicts:
+                if r['store'] == s['store']: continue
                 if r['deficit'] <= 0: continue
                 if s['surplus'] <= 0 or s['cur_stk'] <= 0: break
 
@@ -289,8 +318,8 @@ def calculate_new_moves(sales_df, stock_df, order_df, exclude_stores):
                 if move_qty > 0:
                     s['cur_stk'] -= move_qty
                     r['cur_stk'] += move_qty
-                    s['surplus'] -= move_qty
-                    r['deficit'] -= move_qty
+                    s['surplus'] = max(0.0, s['surplus'] - move_qty)
+                    r['deficit'] = max(0.0, r['deficit'] - move_qty)
 
                     # WOS表記の調整
                     s_pre_wos = f"{s['stock_qty'] / s['recent_weekly_sales']:.1f}週" if s['recent_weekly_sales'] > 0 else "—"
@@ -779,8 +808,18 @@ def main():
         wb.remove(default_sheet)
 
     print(f"Excelファイルを保存しています: {output_file}")
-    wb.save(output_file)
-    print("=== レポート生成が正常に完了しました ===")
+    try:
+        wb.save(output_file)
+        print("=== レポート生成が正常に完了しました ===")
+    except PermissionError:
+        import datetime
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        fallback_file = f"WOS_Report_店舗出荷_{timestamp}.xlsx"
+        wb.save(fallback_file)
+        print(f"\n[⚠️ 警告] '{output_file}' は現在Excel等で開かれているため上書き保存できませんでした。")
+        print(f"[✅ 代替保存] '{fallback_file}' として新規保存しました。")
+        print(f"※'{output_file}' を更新したい場合は、Excelファイルを閉じてから再度実行してください。")
+        print("=== レポート生成が代替ファイル名で完了しました ===")
 
 if __name__ == '__main__':
     main()

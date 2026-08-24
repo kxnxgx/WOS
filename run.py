@@ -72,11 +72,13 @@ def main():
     parser = argparse.ArgumentParser(description="売上・在庫データからアイテム移動リストを生成します")
     parser.add_argument("--sales", type=str, default=None, help="売上データのCSVパス（省略時は自動検索）")
     parser.add_argument("--stock", type=str, default=None, help="在庫データのCSVパス（省略時は自動検索）")
-    parser.add_argument("--order", type=str, default=None, help="発注数ExcelファイルのパスCSVパス（省略時は自動検索）")
+    parser.add_argument("--order", type=str, default=None, help="発注数Excelファイルのパス（省略時は自動検索）")
     parser.add_argument("--next-order", type=str, default=None,
                         help="次シーズン発注数Excelのパス（省略時はFW発注数ファイルを自動検索）")
     parser.add_argument("--ship-alloc", type=str, default=None,
                         help="出荷予定振分CSVのパス（省略時は自動検索）")
+    parser.add_argument("--master", type=str, default=None,
+                        help="商品マスタCSVのパス（省略時は自動検索）")
     parser.add_argument("--threshold", type=float, default=80.0,
                         help="消化率の優先集約閾値 %% (デフォルト: 80.0)")
     args = parser.parse_args()
@@ -149,19 +151,36 @@ def main():
             ship_alloc_path = found_alloc
             print(f"[自動検索] 出荷予定振分データを検出しました: {os.path.basename(ship_alloc_path)}")
 
+    # --- 商品マスタデータのパス解決（商品名・カラー名補完用・任意）---
+    master_path = None
+    if hasattr(args, 'master') and args.master:
+        master_path = args.master
+        print(f"[指定] 商品マスタデータ: {os.path.basename(master_path)}")
+    else:
+        found_master = find_latest_csv("商品マスタ")
+        if found_master:
+            master_path = found_master
+            print(f"[自動検索] 商品マスタデータを検出しました: {os.path.basename(master_path)}")
+
     # 除外対象店舗リスト（WOS計算・移動推奨・ヒートマップ対象外）
+    # ※New Way, ZOZO, ユニフォーム, 丸井, バルク, テスト店舗はWOSCalculatorで自動除外されます。
     # ※全社の消化率計算（累計売上）には含まれます。
-    EXCLUDE_STORES = ['6142']
+    EXCLUDE_STORES = ['6142', 'FJALLRAVEN by 3NITY']
 
     print(f"[設定] 優先集約の消化率閾値: {args.threshold:.0f}%")
     if EXCLUDE_STORES:
-        print(f"[設定] 移動・WOS計算からの除外店舗: {', '.join(EXCLUDE_STORES)}")
+        print(f"[設定] 明示的除外店舗: {', '.join(EXCLUDE_STORES)}")
 
     try:
         # 1. データロード
         loader = DataLoader(sales_path, stock_path)
         sales_df = loader.load_sales_history()
         stock_df = loader.load_current_stock()
+
+        # 商品マスタデータ（任意）
+        item_master_df = None
+        if master_path and os.path.exists(master_path):
+            item_master_df = loader.load_item_master(master_path)
 
         # 発注数データ（任意）
         order_df = None
@@ -178,9 +197,10 @@ def main():
         if ship_alloc_path and os.path.exists(ship_alloc_path):
             bulk_df = loader.load_bulk_stock(ship_alloc_path)
 
-        # 2. WOS計算（+ 消化率・継続品判定・BULK在庫・店舗除外）
+        # 2. WOS計算（+ 消化率・継続品判定・BULK在庫・店舗除外・マスタ補完）
         wos_df = WOSCalculator.calculate(
             sales_df, stock_df,
+            item_master_df=item_master_df,
             order_df=order_df,
             next_order_df=next_order_df,
             bulk_df=bulk_df,
@@ -192,11 +212,15 @@ def main():
 
         # 4. レポート生成
         Reporter.generate_excel(wos_df, move_df, "WOS_Report.xlsx")
+        Reporter.generate_all_stock_excel(wos_df, move_df, "WOS_全店在庫一覧.xlsx")
         Reporter.generate_html(wos_df, move_df, "WOS_Report.html", threshold=args.threshold)
+        Reporter.generate_provisional_matrix_excel(wos_df, move_df, "暫定移動明細.xlsx")
 
         print("\n処理が完了しました！")
-        print("- WOS_Report.xlsx (Excelレポート)")
+        print("- WOS_Report.xlsx (Excelレポート: 集約リスト・店舗別WOS・生データ・全店現在庫一覧)")
+        print("- WOS_全店在庫一覧.xlsx (コピー用Excel: 全店舗の現在庫・消化率・集約先情報)")
         print("- WOS_Report.html (HTMLレポート)")
+        print("- 暫定移動明細.xlsx (作業用マトリクスExcel)")
 
     except Exception as e:
         import traceback

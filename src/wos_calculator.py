@@ -1,9 +1,25 @@
 import pandas as pd
 import numpy as np
+import re
 
 class WOSCalculator:
+    EXCLUDE_STORE_PATTERN = r'バルク|BULK|bulk|New Way|NWA|new way|ZOZO|zozo|ユニフォーム|ﾕﾆﾌｫｰﾑ|uniform|丸井|マルイ|marui|テスト|test|^FJALLRAVEN by 3NITY$'
+
+    @classmethod
+    def is_excluded_store(cls, store_name: str, exclude_stores: list = None) -> bool:
+        """除外対象の拠点・店舗かどうかを判定する"""
+        s = str(store_name).strip()
+        if not s:
+            return True
+        if exclude_stores and s in [str(x).strip() for x in exclude_stores]:
+            return True
+        if re.search(cls.EXCLUDE_STORE_PATTERN, s, re.IGNORECASE):
+            return True
+        return False
+
     @staticmethod
     def calculate(sales_df: pd.DataFrame, stock_df: pd.DataFrame,
+                  item_master_df: pd.DataFrame = None,
                   order_df: pd.DataFrame = None,
                   next_order_df: pd.DataFrame = None,
                   bulk_df: pd.DataFrame = None,
@@ -28,24 +44,18 @@ class WOSCalculator:
         if sales_df.empty or stock_df.empty:
             raise ValueError("売上データまたは在庫データが空です。")
 
-        # 在庫データ内のバルク（他社分を含むため店舗間移動から除外）
-        bulk_mask = stock_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False)
-
-        # 除外店舗のフィルタリング（WOS計算・移動推奨・ヒートマップ対象外）
-        # ※バルク（倉庫）も店舗間移動の対象外として除外
-        exclude_strs = [str(s).strip() for s in exclude_stores] if exclude_stores else []
-        if exclude_strs:
-            print(f"WOS計算・移動推奨から除外する店舗: {exclude_strs}")
-            
+        # 除外店舗のフィルタリング（NWA, ZOZO, ユニフォーム, 丸井, バルク, テスト店舗, 6142等）
         stock_for_wos = stock_df[
-            (~stock_df['store'].astype(str).str.strip().isin(exclude_strs)) &
-            (~bulk_mask)
+            ~stock_df['store'].apply(lambda s: WOSCalculator.is_excluded_store(s, exclude_stores))
         ].copy()
         
         sales_for_wos = sales_df[
-            (~sales_df['store'].astype(str).str.strip().isin(exclude_strs)) &
-            (~sales_df['store'].astype(str).str.contains('バルク|BULK|bulk', case=False, na=False))
+            ~sales_df['store'].apply(lambda s: WOSCalculator.is_excluded_store(s, exclude_stores))
         ].copy()
+
+        excluded_stock_count = len(stock_df) - len(stock_for_wos)
+        if excluded_stock_count > 0:
+            print(f"対象外店舗の在庫レコード {excluded_stock_count} 件を除外しました。")
             
         # 最近4週間（28日間）のデータを抽出（除外店舗を除く）
         max_date = sales_for_wos['date'].max()
@@ -85,11 +95,53 @@ class WOSCalculator:
             wos_df['stock_qty'] / wos_df['avg_sales_4w'], 
             np.nan
         )
-        
+
+        # --- フォールバックWOS（全期間平均週販ベース）---
+        # 直近4週に売上がなくても、全期間（期初〜最新日付）に売上実績がある
+        # 店舗×SKUは「全期間平均週販」を用いてWOSを補完する。
+        # これにより「在庫あり・最近売れていない」店舗も移動推奨の対象になる。
+        total_weeks = max((max_date - sales_for_wos['date'].min()).days / 7, 1)
+        full_period_sales = (
+            sales_for_wos
+            .groupby(['store', 'sku'])['sales_qty']
+            .sum()
+            .reset_index()
+            .rename(columns={'sales_qty': 'total_sales_full'})
+        )
+        full_period_sales['avg_sales_full'] = full_period_sales['total_sales_full'] / total_weeks
+
+        wos_df = pd.merge(
+            wos_df,
+            full_period_sales[['store', 'sku', 'avg_sales_full']],
+            on=['store', 'sku'],
+            how='left'
+        )
+        wos_df['avg_sales_full'] = wos_df['avg_sales_full'].fillna(0)
+
+        # フォールバックWOS: avg_sales_4w=0 かつ avg_sales_full が月1点以上（>=0.25/週）の場合のみ算出
+        # ※ 月1点未満の超低速品は「実質的に動いていない」とみなし移動推奨対象外とする
+        FALLBACK_MIN_AVG = 0.25  # 週0.25点 = 月1点相当
+        wos_df['wos_fallback'] = np.where(
+            (wos_df['avg_sales_4w'] == 0) & (wos_df['avg_sales_full'] >= FALLBACK_MIN_AVG),
+            wos_df['stock_qty'] / wos_df['avg_sales_full'],
+            np.nan
+        )
+
         # 商品名とColorNameをマスタとして結合する
+        sku_master_list = []
+        if item_master_df is not None and not item_master_df.empty:
+            sku_master_list.append(item_master_df[['sku', 'item_name', 'color_name']])
         if 'item_name' in sales_df.columns and 'color_name' in sales_df.columns:
-            sku_master = sales_df[['sku', 'item_name', 'color_name']].drop_duplicates(subset=['sku'])
-            wos_df = pd.merge(wos_df, sku_master, on='sku', how='left')
+            sku_master_list.append(sales_df[['sku', 'item_name', 'color_name']])
+
+        if sku_master_list:
+            combined_master = pd.concat(sku_master_list, ignore_index=True)
+            # Unknownでないレコードを優先
+            valid_mask = (combined_master['item_name'] != 'Unknown') & (combined_master['color_name'] != 'Unknown')
+            combined_master = pd.concat([combined_master[valid_mask], combined_master[~valid_mask]], ignore_index=True)
+            combined_master = combined_master.drop_duplicates(subset=['sku'], keep='first')
+
+            wos_df = pd.merge(wos_df, combined_master, on='sku', how='left')
             wos_df['item_name'] = wos_df['item_name'].fillna('Unknown')
             wos_df['color_name'] = wos_df['color_name'].fillna('Unknown')
 
